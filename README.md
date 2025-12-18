@@ -14,6 +14,14 @@ Configures SSH for **public-key-only** authentication and moves SSH off port 22 
 sudo ./main.sh
 ```
 
+远程一键执行（需信任此仓库，确保以 root / sudo 运行）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Banezzz/ssh-key/refs/heads/main/main.sh | sudo bash
+# 或：
+wget -qO- https://raw.githubusercontent.com/Banezzz/ssh-key/refs/heads/main/main.sh | sudo bash
+```
+
 运行时会提示输入 SSH 端口（直接回车默认 54271），也可继续使用位置参数传入：
 
 ```bash
