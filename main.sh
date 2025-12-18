@@ -232,6 +232,11 @@ read_keys_interactive() {
     if [ -z "$line" ]; then
       break
     fi
+    # Ignore accidental pastes of the prompt text itself
+    if echo "$line" | grep -qi '^paste ssh public keys'; then
+      maybe_warn "Ignored prompt text; please paste an actual SSH public key."
+      continue
+    fi
     if ! is_valid_key_line "$line"; then
       echo "That does not look like a valid SSH public key line. Try again." >&2
       continue
@@ -391,7 +396,20 @@ main() {
   require_linux
   require_root
 
-  local port_input port cfg
+  local port_input port cfg skip_self_test
+
+  # Parse flags. Default: skip self-test (common when running on server without the private key).
+  skip_self_test="1"
+  local args=()
+  for a in "$@"; do
+    case "$a" in
+      --skip-self-test) skip_self_test="1" ;; # default; kept for compatibility
+      --self-test|--enable-self-test) skip_self_test="0" ;;
+      *) args+=("$a") ;;
+    esac
+  done
+  set -- "${args[@]}"
+
   if [ "${1:-}" != "" ]; then
     port_input="$1"
   else
@@ -444,11 +462,15 @@ main() {
   fi
   restart_ssh "$family"
 
-  if ! ssh_self_test "$port" "$username"; then
-    echo "Self-test on localhost port $port failed. Restoring backup." >&2
-    cp "$orig_backup" "$cfg"
-    restart_ssh "$family" || true
-    die "Aborted because SSH on new port could not be verified."
+  if [ "$skip_self_test" = "1" ]; then
+    maybe_warn "Skipping SSH self-test (default). Add --self-test to enable localhost verification."
+  else
+    if ! ssh_self_test "$port" "$username"; then
+      echo "Self-test on localhost port $port failed. Restoring backup." >&2
+      cp "$orig_backup" "$cfg"
+      restart_ssh "$family" || true
+      die "Aborted because SSH on new port could not be verified."
+    fi
   fi
 
   # Stage 2: final (only new port, disable password auth)

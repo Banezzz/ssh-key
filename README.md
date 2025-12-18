@@ -14,12 +14,17 @@ Configures SSH for **public-key-only** authentication and moves SSH off port 22 
 sudo ./main.sh
 ```
 
-远程一键执行（需信任此仓库，确保以 root / sudo 运行）：
+远程一键执行（需信任此仓库，确保以 root / sudo 运行；保留 TTY 以便交互输入端口和公钥）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Banezzz/ssh-key/refs/heads/main/main.sh | sudo bash
-# 或：
-wget -qO- https://raw.githubusercontent.com/Banezzz/ssh-key/refs/heads/main/main.sh | sudo bash
+# 推荐：先下载再执行，交互正常
+curl -fsSL https://raw.githubusercontent.com/Banezzz/ssh-key/refs/heads/main/main.sh -o /tmp/main.sh
+sudo bash /tmp/main.sh
+
+# 或一行式（保留 TTY）：让脚本从 /dev/tty 读交互
+curl -fsSL https://raw.githubusercontent.com/Banezzz/ssh-key/refs/heads/main/main.sh | sudo bash -s -- </dev/tty
+# wget 版本
+wget -qO- https://raw.githubusercontent.com/Banezzz/ssh-key/refs/heads/main/main.sh | sudo bash -s -- </dev/tty
 ```
 
 运行时会提示输入 SSH 端口（直接回车默认 54271），也可继续使用位置参数传入：
@@ -36,6 +41,7 @@ You will be prompted to:
 - Confirm you have opened the new SSH port in firewall/security group before applying changes
 - Username is validated to exist on the system (format + presence)
 - Safe mode: two-stage apply. Stage 1 keeps old port + enables new port without disabling passwords, self-tests `ssh -p <new> user@localhost`. Only after pass does Stage 2 switch to key-only and new port.
+- Self-test is **skipped by default** (适用于在服务器本机执行、没有私钥在本机的情况)。若你在有私钥的客户端执行，建议加 `--self-test`（或 `--enable-self-test`）开启本机自测以避免配置错误。
 
 ## Arguments
 
@@ -43,6 +49,11 @@ You will be prompted to:
 
 - `<port>`: SSH port (default: 54271; must be 1024-65535). If omitted, you will be prompted.
 - `<sshd_config_path>`: path to sshd_config (default: `/etc/ssh/sshd_config`)
+
+Optional flag:
+
+- `--self-test` / `--enable-self-test`: enable the localhost SSH self-test on the new port (default is skipped).
+- `--skip-self-test`: explicitly skip the self-test (default behavior).
 
 ## Important
 
