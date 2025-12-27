@@ -37,11 +37,65 @@ sudo ./main.sh 60022 /etc/ssh/sshd_config
 You will be prompted to:
 
 - Choose the target username whose `~/.ssh/authorized_keys` will be updated
-- Paste one or more SSH public keys (press Enter on an empty line to finish)
+- **Use existing keys or add new ones**: If valid keys already exist, you can skip key input
+- Paste one or more SSH public keys (press Enter on an empty line to finish) - only if adding new keys
+- **Select hardening level** (basic / standard / strict)
 - Confirm you have opened the new SSH port in firewall/security group before applying changes
+
+Features:
+
 - Username is validated to exist on the system (format + presence)
+- **Validates authorized_keys**: checks file is not empty and contains valid SSH keys
 - Safe mode: two-stage apply. Stage 1 keeps old port + enables new port without disabling passwords, self-tests `ssh -p <new> user@localhost`. Only after pass does Stage 2 switch to key-only and new port.
 - Self-test is **skipped by default** (适用于在服务器本机执行、没有私钥在本机的情况)。若你在有私钥的客户端执行，建议加 `--self-test`（或 `--enable-self-test`）开启本机自测以避免配置错误。
+
+## Hardening Levels
+
+| Level | Description |
+| --- | --- |
+| **basic** | Disable password auth, change port, disable insecure auth methods |
+| **standard** | Basic + disable root login, auth limits, timeouts, connection limits |
+| **strict** | Standard + disable all forwarding, strong ciphers only, verbose logging |
+
+### Base Level Configurations (All Levels)
+
+```bash
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+HostbasedAuthentication no
+IgnoreRhosts yes
+StrictModes yes
+```
+
+### Standard Level Configurations
+
+```bash
+PermitRootLogin prohibit-password
+PermitEmptyPasswords no
+MaxAuthTries 3
+MaxSessions 5
+LoginGraceTime 30
+ClientAliveInterval 300
+ClientAliveCountMax 2
+MaxStartups 10:30:60
+```
+
+### Strict Level Additions
+
+```bash
+AllowTcpForwarding no
+AllowAgentForwarding no
+X11Forwarding no
+PermitTunnel no
+GatewayPorts no
+PermitUserEnvironment no
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512
+LogLevel VERBOSE
+```
 
 ## Arguments
 
@@ -63,4 +117,19 @@ Example connection:
 
 ```bash
 ssh -p 54271 user@server-ip
+```
+
+## Firewall Configuration
+
+Make sure your firewall allows the new SSH port:
+
+```bash
+# UFW (Ubuntu/Debian)
+ufw allow 54271/tcp && ufw reload
+
+# firewalld (CentOS/RHEL)
+firewall-cmd --permanent --add-port=54271/tcp && firewall-cmd --reload
+
+# iptables
+iptables -A INPUT -p tcp --dport 54271 -j ACCEPT
 ```

@@ -210,6 +210,33 @@ clean_authorized_keys() {
   echo "Commented out invalid lines in authorized_keys (backup: $backup)."
 }
 
+has_valid_keys() {
+  # Usage: has_valid_keys /path/to/authorized_keys
+  # Returns: 0 if file contains at least one valid key, 1 otherwise
+  local key_file="$1"
+
+  [ -f "$key_file" ] || return 1
+  [ -r "$key_file" ] || return 1
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    local trimmed
+    trimmed="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
+    [ -z "$trimmed" ] && continue
+    echo "$trimmed" | grep -Eq '^#' && continue
+
+    # Check valid SSH key format (key type at field 1 or field 2)
+    if echo "$trimmed" | grep -Eq '^(ssh-(rsa|dss|ed25519)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[[:space:]]+[A-Za-z0-9+/=]+'; then
+      return 0
+    fi
+    if echo "$trimmed" | grep -Eq '^[^[:space:]]+[[:space:]]+(ssh-(rsa|dss|ed25519)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[[:space:]]+[A-Za-z0-9+/=]+'; then
+      return 0
+    fi
+  done < "$key_file"
+
+  return 1
+}
+
 add_key_if_missing() {
   # Usage: add_key_if_missing /path/to/authorized_keys "ssh-ed25519 AAAA... comment"
   local key_file="$1"
@@ -245,6 +272,107 @@ read_keys_interactive() {
   done
 }
 
+choose_hardening_level() {
+  # Interactive selection of SSH hardening level
+  # Returns: basic | standard | strict
+  local choice
+
+  echo ""
+  echo "Select SSH hardening level:"
+  echo ""
+  echo "  1) basic    - Disable password auth, change port"
+  echo "  2) standard - Basic + disable root login, auth limits, timeouts (Recommended)"
+  echo "  3) strict   - Standard + disable forwarding, strong ciphers, verbose logging"
+  echo ""
+
+  while true; do
+    read -r -p "Hardening level [1-3, default=2]: " choice || true
+    choice="${choice:-2}"
+
+    case "$choice" in
+      1|basic)    echo "basic"; return 0 ;;
+      2|standard) echo "standard"; return 0 ;;
+      3|strict)   echo "strict"; return 0 ;;
+      *) echo "Invalid choice. Please enter 1, 2, or 3." >&2 ;;
+    esac
+  done
+}
+
+get_hardening_configs() {
+  # Usage: get_hardening_configs <level>
+  # Returns: newline-separated list of sshd_config directives
+  local level="$1"
+
+  # Base configs (applied to all levels)
+  local base_configs=(
+    "PubkeyAuthentication yes"
+    "PasswordAuthentication no"
+    "KbdInteractiveAuthentication no"
+    "ChallengeResponseAuthentication no"
+    "HostbasedAuthentication no"
+    "IgnoreRhosts yes"
+    "StrictModes yes"
+  )
+
+  # Standard level additions
+  local standard_configs=(
+    "PermitRootLogin prohibit-password"
+    "PermitEmptyPasswords no"
+    "MaxAuthTries 3"
+    "MaxSessions 5"
+    "LoginGraceTime 30"
+    "ClientAliveInterval 300"
+    "ClientAliveCountMax 2"
+    "MaxStartups 10:30:60"
+  )
+
+  # Strict level additions
+  local strict_configs=(
+    "AllowTcpForwarding no"
+    "AllowAgentForwarding no"
+    "X11Forwarding no"
+    "PermitTunnel no"
+    "GatewayPorts no"
+    "PermitUserEnvironment no"
+    "Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com"
+    "MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com"
+    "KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512"
+    "LogLevel VERBOSE"
+  )
+
+  case "$level" in
+    basic)
+      printf '%s\n' "${base_configs[@]}"
+      ;;
+    standard)
+      printf '%s\n' "${base_configs[@]}"
+      printf '%s\n' "${standard_configs[@]}"
+      ;;
+    strict)
+      printf '%s\n' "${base_configs[@]}"
+      printf '%s\n' "${standard_configs[@]}"
+      printf '%s\n' "${strict_configs[@]}"
+      ;;
+    *)
+      die "Unknown hardening level: $level"
+      ;;
+  esac
+}
+
+show_hardening_summary() {
+  # Usage: show_hardening_summary <level>
+  local level="$1"
+
+  echo ""
+  echo "Hardening level: $level"
+  echo "Configuration to be applied:"
+  echo "----------------------------------------"
+  get_hardening_configs "$level" | while IFS= read -r line; do
+    echo "  $line"
+  done
+  echo "----------------------------------------"
+}
+
 make_backup() {
   # Usage: make_backup /etc/ssh/sshd_config
   local cfg="$1"
@@ -255,21 +383,33 @@ make_backup() {
 }
 
 write_sshd_config() {
-  # Usage: write_sshd_config mode cfg new_port "orig_ports"
+  # Usage: write_sshd_config mode cfg new_port "orig_ports" [hardening_level]
   # mode: warmup | final
   local mode="$1"
   local cfg="$2"
   local new_port="$3"
   local orig_ports="$4"
+  local hardening_level="${5:-basic}"
   [ -w "$cfg" ] || die "Cannot write to $cfg. Please run as root."
 
   local tmp ports
   tmp="$(mktemp)"
   chmod 600 "$tmp"
 
-  awk '
+  # Filter patterns for all managed directives
+  local filter_pattern="PubkeyAuthentication|PasswordAuthentication|Port"
+  filter_pattern="${filter_pattern}|KbdInteractiveAuthentication|ChallengeResponseAuthentication"
+  filter_pattern="${filter_pattern}|HostbasedAuthentication|IgnoreRhosts|StrictModes"
+  filter_pattern="${filter_pattern}|PermitRootLogin|PermitEmptyPasswords|MaxAuthTries"
+  filter_pattern="${filter_pattern}|MaxSessions|LoginGraceTime|ClientAliveInterval"
+  filter_pattern="${filter_pattern}|ClientAliveCountMax|MaxStartups|AllowTcpForwarding"
+  filter_pattern="${filter_pattern}|AllowAgentForwarding|X11Forwarding|PermitTunnel"
+  filter_pattern="${filter_pattern}|GatewayPorts|PermitUserEnvironment|Ciphers|MACs"
+  filter_pattern="${filter_pattern}|KexAlgorithms|LogLevel"
+
+  awk -v pattern="$filter_pattern" '
     BEGIN { IGNORECASE=1 }
-    $0 ~ /^[[:space:]]*#?[[:space:]]*(PubkeyAuthentication|PasswordAuthentication|Port)[[:space:]]+/ { next }
+    $0 ~ "^[[:space:]]*#?[[:space:]]*(" pattern ")[[:space:]]+" { next }
     { print }
   ' "$cfg" > "$tmp"
 
@@ -279,18 +419,17 @@ write_sshd_config() {
     echo ""
     if [ "$mode" = "warmup" ]; then
       echo "# Managed by ssh-key helper (warmup stage)"
-    else
-      echo "# Managed by ssh-key helper"
-    fi
-    echo "PubkeyAuthentication yes"
-    if [ "$mode" = "warmup" ]; then
+      echo "PubkeyAuthentication yes"
       echo "PasswordAuthentication yes"
       for p in $ports; do
         echo "Port ${p}"
       done
     else
-      echo "PasswordAuthentication no"
+      echo "# Managed by ssh-key helper (level: $hardening_level)"
       echo "Port ${new_port}"
+      echo ""
+      # Apply hardening configs based on level
+      get_hardening_configs "$hardening_level"
     fi
   } >> "$tmp"
 
@@ -430,17 +569,45 @@ main() {
   key_file="$(ensure_ssh_paths "$username")"
   clean_authorized_keys "$key_file"
 
+  # Check for existing keys and allow user to skip key input
+  local use_existing any_key
   any_key="0"
-  while IFS= read -r key; do
-    [ -n "$key" ] || continue
-    any_key="1"
-    add_key_if_missing "$key_file" "$key"
-  done < <(read_keys_interactive)
 
-  [ "$any_key" = "1" ] || die "No keys provided. Nothing to do."
+  if has_valid_keys "$key_file"; then
+    echo ""
+    echo "Found existing valid keys in: $key_file"
+    read -r -p "Use existing keys without adding new ones? [Y/n]: " use_existing || true
+    use_existing="$(echo "${use_existing:-y}" | tr '[:upper:]' '[:lower:]')"
+
+    if [ "$use_existing" = "y" ] || [ "$use_existing" = "yes" ] || [ -z "$use_existing" ]; then
+      echo "Using existing keys."
+      any_key="1"
+    fi
+  fi
+
+  # If not using existing keys or no valid keys exist, prompt for new keys
+  if [ "$any_key" = "0" ]; then
+    if ! has_valid_keys "$key_file"; then
+      echo ""
+      maybe_warn "No valid keys found in $key_file. You must provide at least one SSH public key."
+    fi
+
+    while IFS= read -r key; do
+      [ -n "$key" ] || continue
+      any_key="1"
+      add_key_if_missing "$key_file" "$key"
+    done < <(read_keys_interactive)
+  fi
+
+  [ "$any_key" = "1" ] || die "No keys provided and no existing valid keys. Cannot proceed."
+
+  # Choose hardening level
+  local hardening_level
+  hardening_level="$(choose_hardening_level)"
+  show_hardening_summary "$hardening_level"
 
   echo ""
-  echo "About to set SSH port to $port, enable public key auth, and disable password auth."
+  echo "About to set SSH port to $port and apply '$hardening_level' hardening."
   echo "Ensure the firewall / security group allows TCP $port and you have a working key-based session."
   read -r -p "Proceed? [y/N]: " confirm
   confirm="$(echo "${confirm:-}" | tr '[:upper:]' '[:lower:]')"
@@ -473,8 +640,8 @@ main() {
     fi
   fi
 
-  # Stage 2: final (only new port, disable password auth)
-  write_sshd_config "final" "$cfg" "$port" "$orig_ports"
+  # Stage 2: final (only new port, apply hardening)
+  write_sshd_config "final" "$cfg" "$port" "$orig_ports" "$hardening_level"
   if ! validate_sshd_config "$cfg"; then
     echo "Restoring previous sshd_config from backup: $orig_backup" >&2
     cp "$orig_backup" "$cfg"
@@ -484,8 +651,22 @@ main() {
   restart_ssh "$family"
 
   echo ""
-  echo "Done. SSH should now listen on port $port with password auth disabled."
+  echo "Done. SSH hardening complete!"
+  echo "  - Port: $port"
+  echo "  - Hardening level: $hardening_level"
+  echo "  - Password auth: disabled"
+  echo ""
   echo "Example: ssh -p $port $username@<server-ip>"
+  echo ""
+  echo "Firewall rules (if not already configured):"
+  echo "  # UFW (Ubuntu/Debian)"
+  echo "  ufw allow $port/tcp && ufw reload"
+  echo ""
+  echo "  # firewalld (CentOS/RHEL)"
+  echo "  firewall-cmd --permanent --add-port=$port/tcp && firewall-cmd --reload"
+  echo ""
+  echo "  # iptables"
+  echo "  iptables -A INPUT -p tcp --dport $port -j ACCEPT"
 }
 
 main "$@"
