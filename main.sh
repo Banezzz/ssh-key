@@ -153,9 +153,9 @@ extract_ports() {
   local cfg="$1"
   local ports
   ports=$(awk '
-    BEGIN { IGNORECASE=1 }
     /^[[:space:]]*#/ { next }
-    /^[[:space:]]*Port[[:space:]]+/ { print $2 }
+    { low = tolower($0) }
+    low ~ /^[[:space:]]*port[[:space:]]+/ { print $2 }
   ' "$cfg" | tr '\n' ' ')
   if [ -z "$ports" ]; then
     echo "22"
@@ -207,7 +207,11 @@ clean_authorized_keys() {
 
   chmod 600 "$key_file"
   run_restorecon "$key_file"
-  echo "Commented out invalid lines in authorized_keys (backup: $backup)."
+  if ! diff -q "$backup" "$key_file" >/dev/null 2>&1; then
+    echo "Commented out invalid lines in authorized_keys (backup: $backup)."
+  else
+    echo "authorized_keys validated; no invalid lines found."
+  fi
 }
 
 has_valid_keys() {
@@ -250,7 +254,7 @@ add_key_if_missing() {
 }
 
 read_keys_interactive() {
-  echo "Paste SSH public keys, one per line. Press Enter on an empty line to finish."
+  echo "Paste SSH public keys, one per line. Press Enter on an empty line to finish." >&2
   while true; do
     local line=""
     # shellcheck disable=SC2162
@@ -277,13 +281,13 @@ choose_hardening_level() {
   # Returns: basic | standard | strict
   local choice
 
-  echo ""
-  echo "Select SSH hardening level:"
-  echo ""
-  echo "  1) basic    - Disable password auth, change port"
-  echo "  2) standard - Basic + disable root login, auth limits, timeouts (Recommended)"
-  echo "  3) strict   - Standard + disable forwarding, strong ciphers, verbose logging"
-  echo ""
+  echo "" >&2
+  echo "Select SSH hardening level:" >&2
+  echo "" >&2
+  echo "  1) basic    - Disable password auth, change port" >&2
+  echo "  2) standard - Basic + disable root login, auth limits, timeouts (Recommended)" >&2
+  echo "  3) strict   - Standard + disable forwarding, strong ciphers, verbose logging" >&2
+  echo "" >&2
 
   while true; do
     read -r -p "Hardening level [1-3, default=2]: " choice || true
@@ -396,20 +400,20 @@ write_sshd_config() {
   tmp="$(mktemp)"
   chmod 600 "$tmp"
 
-  # Filter patterns for all managed directives
-  local filter_pattern="PubkeyAuthentication|PasswordAuthentication|Port"
-  filter_pattern="${filter_pattern}|KbdInteractiveAuthentication|ChallengeResponseAuthentication"
-  filter_pattern="${filter_pattern}|HostbasedAuthentication|IgnoreRhosts|StrictModes"
-  filter_pattern="${filter_pattern}|PermitRootLogin|PermitEmptyPasswords|MaxAuthTries"
-  filter_pattern="${filter_pattern}|MaxSessions|LoginGraceTime|ClientAliveInterval"
-  filter_pattern="${filter_pattern}|ClientAliveCountMax|MaxStartups|AllowTcpForwarding"
-  filter_pattern="${filter_pattern}|AllowAgentForwarding|X11Forwarding|PermitTunnel"
-  filter_pattern="${filter_pattern}|GatewayPorts|PermitUserEnvironment|Ciphers|MACs"
-  filter_pattern="${filter_pattern}|KexAlgorithms|LogLevel"
+  # Filter patterns for all managed directives (lowercase for case-insensitive matching)
+  local filter_pattern="pubkeyauthentication|passwordauthentication|port"
+  filter_pattern="${filter_pattern}|kbdinteractiveauthentication|challengeresponseauthentication"
+  filter_pattern="${filter_pattern}|hostbasedauthentication|ignorerhosts|strictmodes"
+  filter_pattern="${filter_pattern}|permitrootlogin|permitemptypasswords|maxauthtries"
+  filter_pattern="${filter_pattern}|maxsessions|logingracetime|clientaliveinterval"
+  filter_pattern="${filter_pattern}|clientalivecountmax|maxstartups|allowtcpforwarding"
+  filter_pattern="${filter_pattern}|allowagentforwarding|x11forwarding|permittunnel"
+  filter_pattern="${filter_pattern}|gatewayports|permituserenvironment|ciphers|macs"
+  filter_pattern="${filter_pattern}|kexalgorithms|loglevel"
 
   awk -v pattern="$filter_pattern" '
-    BEGIN { IGNORECASE=1 }
-    $0 ~ "^[[:space:]]*#?[[:space:]]*(" pattern ")[[:space:]]+" { next }
+    { low = tolower($0) }
+    low ~ "^[[:space:]]*#?[[:space:]]*(" pattern ")[[:space:]]+" { next }
     { print }
   ' "$cfg" > "$tmp"
 
@@ -547,7 +551,7 @@ main() {
       *) args+=("$a") ;;
     esac
   done
-  set -- "${args[@]}"
+  set -- ${args[@]+"${args[@]}"}
 
   if [ "${1:-}" != "" ]; then
     port_input="$1"
@@ -561,7 +565,7 @@ main() {
   echo "$port" | grep -Eq '^[0-9]+$' || die "Port must be numeric."
   [ "$port" -ge 1024 ] && [ "$port" -le 65535 ] || die "Port must be between 1024 and 65535."
 
-  local family username key_file keys_added any_key
+  local family username key_file any_key
   family="$(detect_family)"
   echo "Detected Linux family: $family"
 
@@ -570,7 +574,7 @@ main() {
   clean_authorized_keys "$key_file"
 
   # Check for existing keys and allow user to skip key input
-  local use_existing any_key
+  local use_existing
   any_key="0"
 
   if has_valid_keys "$key_file"; then
@@ -579,7 +583,7 @@ main() {
     read -r -p "Use existing keys without adding new ones? [Y/n]: " use_existing || true
     use_existing="$(echo "${use_existing:-y}" | tr '[:upper:]' '[:lower:]')"
 
-    if [ "$use_existing" = "y" ] || [ "$use_existing" = "yes" ] || [ -z "$use_existing" ]; then
+    if [ "$use_existing" = "y" ] || [ "$use_existing" = "yes" ]; then
       echo "Using existing keys."
       any_key="1"
     fi
@@ -609,7 +613,7 @@ main() {
   echo ""
   echo "About to set SSH port to $port and apply '$hardening_level' hardening."
   echo "Ensure the firewall / security group allows TCP $port and you have a working key-based session."
-  read -r -p "Proceed? [y/N]: " confirm
+  read -r -p "Proceed? [y/N]: " confirm || true
   confirm="$(echo "${confirm:-}" | tr '[:upper:]' '[:lower:]')"
   if [ "$confirm" != "y" ] && [ "$confirm" != "yes" ]; then
     die "Aborted by user."
@@ -650,13 +654,25 @@ main() {
   fi
   restart_ssh "$family"
 
+  if [ "$skip_self_test" = "0" ]; then
+    if ! ssh_self_test "$port" "$username"; then
+      maybe_warn "SSH self-test failed after final stage. Restoring backup."
+      cp "$orig_backup" "$cfg"
+      restart_ssh "$family" || true
+      die "Aborted because SSH with final config could not be verified."
+    fi
+  fi
+
   echo ""
   echo "Done. SSH hardening complete!"
   echo "  - Port: $port"
   echo "  - Hardening level: $hardening_level"
   echo "  - Password auth: disabled"
   echo ""
-  echo "Example: ssh -p $port $username@<server-ip>"
+  echo "WARNING: Do NOT close this SSH session until you have verified"
+  echo "  that you can connect with the new configuration from another terminal:"
+  echo ""
+  echo "  ssh -p $port $username@<server-ip>"
   echo ""
   echo "Firewall rules (if not already configured):"
   echo "  # UFW (Ubuntu/Debian)"
