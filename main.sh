@@ -12,6 +12,37 @@ set -euo pipefail
 DEFAULT_PORT="54271"
 SSHD_CONFIG_DEFAULT="/etc/ssh/sshd_config"
 SSH_SELFTEST_TIMEOUT=5
+LOCK_FILE="/var/run/ssh-key-hardening.lock"
+
+# Global state for signal trap rollback
+_ROLLBACK_BACKUP=""
+_ROLLBACK_CFG=""
+_ROLLBACK_FAMILY=""
+_TMP_FILES=()
+
+cleanup_on_exit() {
+  local exit_code=$?
+  # Remove temp files
+  for f in ${_TMP_FILES[@]+"${_TMP_FILES[@]}"}; do
+    [ -f "$f" ] && rm -f "$f"
+  done
+  # Remove lock file
+  [ -f "$LOCK_FILE" ] && rm -f "$LOCK_FILE"
+  # Rollback if interrupted during two-stage apply
+  if [ $exit_code -ne 0 ] && [ -n "$_ROLLBACK_BACKUP" ] && [ -n "$_ROLLBACK_CFG" ]; then
+    echo "" >&2
+    echo "WARN: Script interrupted. Restoring sshd_config from backup." >&2
+    cp "$_ROLLBACK_BACKUP" "$_ROLLBACK_CFG"
+    if [ -n "$_ROLLBACK_FAMILY" ]; then
+      restart_ssh "$_ROLLBACK_FAMILY" 2>/dev/null || true
+    fi
+  fi
+}
+trap cleanup_on_exit EXIT
+
+register_tmp_file() {
+  _TMP_FILES+=("$1")
+}
 
 die() {
   echo "ERROR: $*" >&2
@@ -143,6 +174,19 @@ ensure_ssh_paths() {
     fi
   fi
 
+  # StrictModes requires home dir not be group/world-writable
+  local home_perms
+  home_perms="$(stat -c '%a' "$home" 2>/dev/null || stat -f '%Lp' "$home" 2>/dev/null)"
+  if [ -n "$home_perms" ]; then
+    local group_write="${home_perms:1:1}"
+    local other_write="${home_perms:2:1}"
+    if [ "$group_write" -ge 2 ] 2>/dev/null || [ "$other_write" -ge 2 ] 2>/dev/null; then
+      maybe_warn "Home directory $home has permissive permissions ($home_perms). StrictModes may reject key auth."
+      chmod go-w "$home"
+      echo "Fixed: removed group/other write from $home"
+    fi
+  fi
+
   run_restorecon "$ssh_dir" "$key_file"
   echo "$key_file"
 }
@@ -241,16 +285,47 @@ has_valid_keys() {
   return 1
 }
 
+warn_weak_key() {
+  # Warn if key type is deprecated or weak
+  local key="$1"
+  local key_type
+  key_type="$(echo "$key" | awk '{
+    if ($1 ~ /^(ssh-|ecdsa-|sk-)/) print $1; else print $2
+  }')"
+  case "$key_type" in
+    ssh-dss)
+      maybe_warn "ssh-dss (DSA) keys are deprecated and insecure (fixed 1024-bit). Consider using ssh-ed25519."
+      ;;
+    ssh-rsa)
+      maybe_warn "ssh-rsa uses SHA-1 signatures which are deprecated in OpenSSH 8.8+. Consider using ssh-ed25519."
+      ;;
+  esac
+}
+
+show_key_fingerprint() {
+  # Display SSH key fingerprint for visual verification
+  local key="$1"
+  if command -v ssh-keygen >/dev/null 2>&1; then
+    local fp
+    fp="$(echo "$key" | ssh-keygen -l -f - 2>/dev/null)" || true
+    if [ -n "$fp" ]; then
+      echo "  Fingerprint: $fp"
+    fi
+  fi
+}
+
 add_key_if_missing() {
   # Usage: add_key_if_missing /path/to/authorized_keys "ssh-ed25519 AAAA... comment"
   local key_file="$1"
   local key="$2"
+  warn_weak_key "$key"
   if grep -qxF "$key" "$key_file"; then
     echo "Key already present: ${key:0:40}..."
   else
     echo "$key" >> "$key_file"
     echo "Added key: ${key:0:40}..."
   fi
+  show_key_fingerprint "$key"
 }
 
 read_keys_interactive() {
@@ -328,10 +403,13 @@ get_hardening_configs() {
     "ClientAliveInterval 300"
     "ClientAliveCountMax 2"
     "MaxStartups 10:30:60"
+    "UseDNS no"
+    "PrintLastLog yes"
   )
 
   # Strict level additions
   local strict_configs=(
+    "PermitRootLogin no"
     "AllowTcpForwarding no"
     "AllowAgentForwarding no"
     "X11Forwarding no"
@@ -341,6 +419,9 @@ get_hardening_configs() {
     "Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com"
     "MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com"
     "KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512"
+    "HostKey /etc/ssh/ssh_host_ed25519_key"
+    "HostKey /etc/ssh/ssh_host_rsa_key"
+    "RekeyLimit 512M 1h"
     "LogLevel VERBOSE"
   )
 
@@ -398,6 +479,7 @@ write_sshd_config() {
 
   local tmp ports
   tmp="$(mktemp)"
+  register_tmp_file "$tmp"
   chmod 600 "$tmp"
 
   # Filter patterns for all managed directives (lowercase for case-insensitive matching)
@@ -409,7 +491,7 @@ write_sshd_config() {
   filter_pattern="${filter_pattern}|clientalivecountmax|maxstartups|allowtcpforwarding"
   filter_pattern="${filter_pattern}|allowagentforwarding|x11forwarding|permittunnel"
   filter_pattern="${filter_pattern}|gatewayports|permituserenvironment|ciphers|macs"
-  filter_pattern="${filter_pattern}|kexalgorithms|loglevel"
+  filter_pattern="${filter_pattern}|kexalgorithms|loglevel|usedns|printlastlog|rekeylimit|hostkey"
 
   awk -v pattern="$filter_pattern" '
     { low = tolower($0) }
@@ -439,6 +521,8 @@ write_sshd_config() {
 
   cat "$tmp" > "$cfg"
   rm -f "$tmp"
+  chmod 600 "$cfg"
+  chown root:root "$cfg" 2>/dev/null || true
   run_restorecon "$cfg"
 }
 
@@ -495,6 +579,22 @@ restart_ssh() {
   die "Failed to restart SSH service automatically. Please restart it manually."
 }
 
+disable_weak_host_keys() {
+  # Disable DSA host keys (insecure) by renaming them
+  local key_dir="/etc/ssh"
+  local changed=0
+  for kf in "$key_dir"/ssh_host_dsa_key "$key_dir"/ssh_host_dsa_key.pub; do
+    if [ -f "$kf" ]; then
+      mv "$kf" "${kf}.disabled"
+      echo "Disabled weak host key: $kf -> ${kf}.disabled"
+      changed=1
+    fi
+  done
+  if [ "$changed" = "0" ]; then
+    echo "No weak DSA host keys found."
+  fi
+}
+
 ssh_self_test() {
   # Usage: ssh_self_test port username
   # Returns: 0 on success, 1 on failure
@@ -538,6 +638,19 @@ ssh_self_test() {
 main() {
   require_linux
   require_root
+
+  # Prevent concurrent execution
+  if [ -f "$LOCK_FILE" ]; then
+    local lock_pid
+    lock_pid="$(cat "$LOCK_FILE" 2>/dev/null)"
+    if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+      die "Another instance is running (PID: $lock_pid). If this is incorrect, remove $LOCK_FILE"
+    else
+      maybe_warn "Stale lock file found; removing."
+      rm -f "$LOCK_FILE"
+    fi
+  fi
+  echo $$ > "$LOCK_FILE"
 
   local port_input port cfg skip_self_test
 
@@ -623,6 +736,11 @@ main() {
   orig_backup="$(make_backup "$cfg")"
   orig_ports="$(extract_ports "$cfg")"
 
+  # Arm the rollback trap during two-stage apply
+  _ROLLBACK_BACKUP="$orig_backup"
+  _ROLLBACK_CFG="$cfg"
+  _ROLLBACK_FAMILY="$family"
+
   # Stage 1: warmup (keep old ports, keep password auth on), then self-test on new port
   write_sshd_config "warmup" "$cfg" "$port" "$orig_ports"
   if ! validate_sshd_config "$cfg"; then
@@ -644,6 +762,11 @@ main() {
     fi
   fi
 
+  # Disable weak host keys in strict mode
+  if [ "$hardening_level" = "strict" ]; then
+    disable_weak_host_keys
+  fi
+
   # Stage 2: final (only new port, apply hardening)
   write_sshd_config "final" "$cfg" "$port" "$orig_ports" "$hardening_level"
   if ! validate_sshd_config "$cfg"; then
@@ -662,6 +785,11 @@ main() {
       die "Aborted because SSH with final config could not be verified."
     fi
   fi
+
+  # Disarm rollback trap — two-stage apply succeeded
+  _ROLLBACK_BACKUP=""
+  _ROLLBACK_CFG=""
+  _ROLLBACK_FAMILY=""
 
   echo ""
   echo "Done. SSH hardening complete!"
