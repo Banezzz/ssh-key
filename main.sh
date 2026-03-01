@@ -635,6 +635,175 @@ ssh_self_test() {
   return 0
 }
 
+find_next_uid() {
+  # Find the next available UID (starting from 1000 for regular users)
+  local max_uid
+  max_uid=$(awk -F: '($3 >= 1000 && $3 < 60000) { if ($3 > max) max=$3 } END { print (max=="" ? 999 : max) }' /etc/passwd)
+  echo $((max_uid + 1))
+}
+
+create_new_user_interactive() {
+  # Usage: create_new_user_interactive family [existing_key_file existing_username]
+  # Interactively create a new system user after hardening is complete.
+  local family="$1"
+  local existing_key_file="${2:-}"
+  local existing_username="${3:-}"
+
+  echo ""
+  read -r -p "Add a new system user? [y/N]: " create_user || true
+  create_user="$(echo "${create_user:-}" | tr '[:upper:]' '[:lower:]')"
+  if [ "$create_user" != "y" ] && [ "$create_user" != "yes" ]; then
+    return 0
+  fi
+
+  # --- Username ---
+  local new_username
+  while true; do
+    read -r -p "Enter new username: " new_username || true
+    new_username="$(echo "${new_username:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    if [ -z "$new_username" ]; then
+      echo "Username cannot be empty. Please try again." >&2
+      continue
+    fi
+    if ! echo "$new_username" | grep -Eq '^[a-z_][a-z0-9_-]*$'; then
+      echo "Invalid format. Use lowercase letters, digits, underscores, or hyphens (must start with letter or underscore)." >&2
+      continue
+    fi
+    if id "$new_username" >/dev/null 2>&1; then
+      echo "User '$new_username' already exists. Please choose a different name." >&2
+      continue
+    fi
+    break
+  done
+
+  # --- UID (auto-detect) ---
+  local new_uid
+  new_uid="$(find_next_uid)"
+  echo "Auto-detected next available UID: $new_uid"
+
+  # --- User group ---
+  local group_name
+  echo ""
+  read -r -p "User group [${new_username}]: " group_name || true
+  group_name="${group_name:-$new_username}"
+
+  if ! echo "$group_name" | grep -Eq '^[a-z_][a-z0-9_-]*$'; then
+    echo "Invalid group name format. Skipping user creation." >&2
+    return 1
+  fi
+
+  # Create group if it doesn't exist
+  if ! getent group "$group_name" >/dev/null 2>&1; then
+    case "$family" in
+      alpine)
+        addgroup "$group_name"
+        ;;
+      *)
+        groupadd "$group_name"
+        ;;
+    esac
+    echo "Created group: $group_name"
+  else
+    echo "Group '$group_name' already exists."
+  fi
+
+  # --- Sudo privileges ---
+  local grant_sudo
+  echo ""
+  echo "SECURITY WARNING: Granting sudo privileges allows this user to execute" >&2
+  echo "  any command as root. This increases the attack surface if the account" >&2
+  echo "  is compromised." >&2
+  read -r -p "Grant sudo privileges to '$new_username'? [y/N]: " grant_sudo || true
+  grant_sudo="$(echo "${grant_sudo:-}" | tr '[:upper:]' '[:lower:]')"
+
+  # --- Create user ---
+  local user_shell="/bin/bash"
+  if [ "$family" = "alpine" ] && [ ! -x /bin/bash ]; then
+    user_shell="/bin/ash"
+  fi
+
+  case "$family" in
+    alpine)
+      adduser -D -u "$new_uid" -G "$group_name" -s "$user_shell" "$new_username"
+      ;;
+    *)
+      useradd -m -u "$new_uid" -g "$group_name" -s "$user_shell" "$new_username"
+      ;;
+  esac
+  echo ""
+  echo "Created user '$new_username' (UID: $new_uid, Group: $group_name, Shell: $user_shell)"
+
+  # --- Set password ---
+  echo ""
+  echo "Set a password for '$new_username' (used for sudo and local login):"
+  passwd "$new_username" || maybe_warn "Password not set. You can set it later with: passwd $new_username"
+
+  # --- Apply sudo ---
+  if [ "$grant_sudo" = "y" ] || [ "$grant_sudo" = "yes" ]; then
+    case "$family" in
+      debian)
+        if getent group sudo >/dev/null 2>&1; then
+          usermod -aG sudo "$new_username"
+          echo "Added '$new_username' to sudo group."
+        else
+          echo "$new_username ALL=(ALL) ALL" > "/etc/sudoers.d/$new_username"
+          chmod 440 "/etc/sudoers.d/$new_username"
+          echo "Created sudoers entry for '$new_username'."
+        fi
+        ;;
+      alpine)
+        if command -v apk >/dev/null 2>&1; then
+          apk add --no-cache sudo 2>/dev/null || true
+        fi
+        if getent group wheel >/dev/null 2>&1; then
+          adduser "$new_username" wheel 2>/dev/null || usermod -aG wheel "$new_username" 2>/dev/null || true
+          echo "Added '$new_username' to wheel group."
+        else
+          mkdir -p /etc/sudoers.d
+          echo "$new_username ALL=(ALL) ALL" > "/etc/sudoers.d/$new_username"
+          chmod 440 "/etc/sudoers.d/$new_username"
+          echo "Created sudoers entry for '$new_username'."
+        fi
+        ;;
+      rhel)
+        if getent group wheel >/dev/null 2>&1; then
+          usermod -aG wheel "$new_username"
+          echo "Added '$new_username' to wheel group."
+        else
+          echo "$new_username ALL=(ALL) ALL" > "/etc/sudoers.d/$new_username"
+          chmod 440 "/etc/sudoers.d/$new_username"
+          echo "Created sudoers entry for '$new_username'."
+        fi
+        ;;
+      *)
+        mkdir -p /etc/sudoers.d
+        echo "$new_username ALL=(ALL) ALL" > "/etc/sudoers.d/$new_username"
+        chmod 440 "/etc/sudoers.d/$new_username"
+        echo "Created sudoers entry for '$new_username'."
+        ;;
+    esac
+  fi
+
+  # --- Copy SSH authorized_keys ---
+  if [ -n "$existing_key_file" ] && [ -f "$existing_key_file" ] && has_valid_keys "$existing_key_file"; then
+    echo ""
+    local copy_keys
+    read -r -p "Copy SSH authorized_keys from '$existing_username' to '$new_username'? [Y/n]: " copy_keys || true
+    copy_keys="$(echo "${copy_keys:-y}" | tr '[:upper:]' '[:lower:]')"
+    if [ "$copy_keys" = "y" ] || [ "$copy_keys" = "yes" ]; then
+      local new_key_file
+      new_key_file="$(ensure_ssh_paths "$new_username")"
+      cp "$existing_key_file" "$new_key_file"
+      chmod 600 "$new_key_file"
+      chown "$new_username":"$group_name" "$new_key_file" 2>/dev/null || true
+      echo "Copied authorized_keys to '$new_username'."
+    fi
+  fi
+
+  echo ""
+  echo "User '$new_username' created successfully."
+}
+
 main() {
   require_linux
   require_root
@@ -790,6 +959,9 @@ main() {
   _ROLLBACK_BACKUP=""
   _ROLLBACK_CFG=""
   _ROLLBACK_FAMILY=""
+
+  # Offer to create a new system user (after hardening is complete)
+  create_new_user_interactive "$family" "$key_file" "$username"
 
   echo ""
   echo "Done. SSH hardening complete!"
