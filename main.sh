@@ -14,6 +14,9 @@ SSHD_CONFIG_DEFAULT="/etc/ssh/sshd_config"
 SSH_SELFTEST_TIMEOUT=5
 LOCK_FILE="/var/run/ssh-key-hardening.lock"
 
+# Regex matching SSH public key types (ERE, for grep -E)
+SSH_KEY_TYPES_RE='(ssh-(rsa|dss|ed25519)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)'
+
 # Global state for signal trap rollback
 _ROLLBACK_BACKUP=""
 _ROLLBACK_CFG=""
@@ -169,7 +172,7 @@ ensure_ssh_paths() {
 
   # Best effort ownership fix
   if command -v chown >/dev/null 2>&1; then
-    if ! chown "$username":"$username" "$ssh_dir" "$key_file" 2>/dev/null; then
+    if ! chown "${username}:" "$ssh_dir" "$key_file" 2>/dev/null; then
       maybe_warn "Failed to set ownership on $ssh_dir and $key_file"
     fi
   fi
@@ -220,8 +223,8 @@ is_valid_key_line() {
   [ -z "$s" ] && return 0
   echo "$s" | grep -Eq '^[#]' && return 0
 
-  echo "$s" | grep -Eq '^(ssh-(rsa|dss|ed25519)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[[:space:]]+[A-Za-z0-9+/=]+' && return 0
-  echo "$s" | grep -Eq '^[^[:space:]]+[[:space:]]+(ssh-(rsa|dss|ed25519)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[[:space:]]+[A-Za-z0-9+/=]+' && return 0
+  echo "$s" | grep -Eq "^${SSH_KEY_TYPES_RE}[[:space:]]+[A-Za-z0-9+/=]+" && return 0
+  echo "$s" | grep -Eq "^[^[:space:]]+[[:space:]]+${SSH_KEY_TYPES_RE}[[:space:]]+[A-Za-z0-9+/=]+" && return 0
   return 1
 }
 
@@ -235,7 +238,6 @@ clean_authorized_keys() {
 
   # Use awk to preserve original newlines and comment out invalid lines.
   awk '
-    function ltrim(s) { sub(/^[ \t\r\n]+/, "", s); return s }
     {
       line=$0
       trimmed=line
@@ -262,27 +264,15 @@ has_valid_keys() {
   # Usage: has_valid_keys /path/to/authorized_keys
   # Returns: 0 if file contains at least one valid key, 1 otherwise
   local key_file="$1"
+  [ -f "$key_file" ] && [ -r "$key_file" ] || return 1
 
-  [ -f "$key_file" ] || return 1
-  [ -r "$key_file" ] || return 1
-
-  while IFS= read -r line || [ -n "$line" ]; do
-    local trimmed
-    trimmed="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-
-    [ -z "$trimmed" ] && continue
-    echo "$trimmed" | grep -Eq '^#' && continue
-
-    # Check valid SSH key format (key type at field 1 or field 2)
-    if echo "$trimmed" | grep -Eq '^(ssh-(rsa|dss|ed25519)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[[:space:]]+[A-Za-z0-9+/=]+'; then
-      return 0
-    fi
-    if echo "$trimmed" | grep -Eq '^[^[:space:]]+[[:space:]]+(ssh-(rsa|dss|ed25519)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[[:space:]]+[A-Za-z0-9+/=]+'; then
-      return 0
-    fi
-  done < "$key_file"
-
-  return 1
+  # Single awk pass instead of per-line sed+grep subprocesses
+  awk '
+    /^[[:space:]]*$/ || /^[[:space:]]*#/ { next }
+    $1 ~ /^(ssh-(rsa|dss|ed25519)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)$/ && $2 ~ /^[A-Za-z0-9+\/=]+/ { found=1; exit }
+    $2 ~ /^(ssh-(rsa|dss|ed25519)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)$/ && $3 ~ /^[A-Za-z0-9+\/=]+/ { found=1; exit }
+    END { exit (found ? 0 : 1) }
+  ' "$key_file"
 }
 
 warn_weak_key() {
@@ -393,9 +383,8 @@ get_hardening_configs() {
     "StrictModes yes"
   )
 
-  # Standard level additions
+  # Standard level additions (PermitRootLogin handled separately per level to avoid conflicts)
   local standard_configs=(
-    "PermitRootLogin prohibit-password"
     "PermitEmptyPasswords no"
     "MaxAuthTries 3"
     "MaxSessions 5"
@@ -409,7 +398,6 @@ get_hardening_configs() {
 
   # Strict level additions
   local strict_configs=(
-    "PermitRootLogin no"
     "AllowTcpForwarding no"
     "AllowAgentForwarding no"
     "X11Forwarding no"
@@ -431,10 +419,12 @@ get_hardening_configs() {
       ;;
     standard)
       printf '%s\n' "${base_configs[@]}"
+      echo "PermitRootLogin prohibit-password"
       printf '%s\n' "${standard_configs[@]}"
       ;;
     strict)
       printf '%s\n' "${base_configs[@]}"
+      echo "PermitRootLogin no"
       printf '%s\n' "${standard_configs[@]}"
       printf '%s\n' "${strict_configs[@]}"
       ;;
@@ -529,12 +519,16 @@ write_sshd_config() {
 validate_sshd_config() {
   # Usage: validate_sshd_config /etc/ssh/sshd_config
   local cfg="$1"
+  local err_output
   command -v sshd >/dev/null 2>&1 || die "sshd binary not found; cannot validate configuration."
-  if sshd -t -f "$cfg" >/dev/null 2>&1; then
+  if err_output="$(sshd -t -f "$cfg" 2>&1)"; then
     echo "sshd config validation passed (sshd -t)."
     return 0
   else
     echo "sshd config validation failed (sshd -t)." >&2
+    if [ -n "$err_output" ]; then
+      echo "  $err_output" >&2
+    fi
     return 1
   fi
 }
@@ -633,6 +627,255 @@ ssh_self_test() {
     return 1
   fi
   return 0
+}
+
+find_next_uid() {
+  # Find the next available UID (starting from 1000 for regular users)
+  local max_uid
+  max_uid=$(awk -F: '($3 >= 1000 && $3 < 60000) { if ($3 > max) max=$3 } END { print (max=="" ? 999 : max) }' /etc/passwd)
+  echo $((max_uid + 1))
+}
+
+write_sudoers_entry() {
+  # Usage: write_sudoers_entry username
+  # Creates /etc/sudoers.d/<username> with visudo validation
+  local username="$1"
+  mkdir -p /etc/sudoers.d
+  echo "$username ALL=(ALL) ALL" > "/etc/sudoers.d/$username"
+  chmod 440 "/etc/sudoers.d/$username"
+  if command -v visudo >/dev/null 2>&1 && ! visudo -c -f "/etc/sudoers.d/$username" >/dev/null 2>&1; then
+    maybe_warn "Sudoers syntax check failed. Removing entry for '$username'."
+    rm -f "/etc/sudoers.d/$username"
+    return 1
+  fi
+  echo "Created sudoers entry for '$username'."
+}
+
+create_new_user_interactive() {
+  # Usage: create_new_user_interactive family [existing_key_file existing_username]
+  # Interactively create a new system user after hardening is complete.
+  local family="$1"
+  local existing_key_file="${2:-}"
+  local existing_username="${3:-}"
+
+  echo ""
+  read -r -p "Add a new system user? [y/N]: " create_user || true
+  create_user="$(echo "${create_user:-}" | tr '[:upper:]' '[:lower:]')"
+  if [ "$create_user" != "y" ] && [ "$create_user" != "yes" ]; then
+    return 0
+  fi
+
+  # --- Username ---
+  local new_username
+  while true; do
+    read -r -p "Enter new username: " new_username || true
+    new_username="$(echo "${new_username:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    if [ -z "$new_username" ]; then
+      echo "Username cannot be empty. Please try again." >&2
+      continue
+    fi
+    if [ ${#new_username} -gt 32 ]; then
+      echo "Username too long (max 32 characters)." >&2
+      continue
+    fi
+    if ! echo "$new_username" | grep -Eq '^[a-z_][a-z0-9_-]*$'; then
+      echo "Invalid format. Use lowercase letters, digits, underscores, or hyphens (must start with letter or underscore)." >&2
+      continue
+    fi
+    if id "$new_username" >/dev/null 2>&1; then
+      echo "User '$new_username' already exists. Please choose a different name." >&2
+      continue
+    fi
+    break
+  done
+
+  # --- UID (auto-detect) ---
+  local new_uid
+  new_uid="$(find_next_uid)"
+  echo "Auto-detected next available UID: $new_uid"
+
+  # --- User group ---
+  local group_name
+  echo ""
+  read -r -p "User group [${new_username}]: " group_name || true
+  group_name="${group_name:-$new_username}"
+
+  if ! echo "$group_name" | grep -Eq '^[a-z_][a-z0-9_-]*$'; then
+    echo "Invalid group name format. Skipping user creation." >&2
+    return 1
+  fi
+
+  # Create group if it doesn't exist
+  if ! getent group "$group_name" >/dev/null 2>&1; then
+    case "$family" in
+      alpine)
+        addgroup "$group_name"
+        ;;
+      *)
+        groupadd "$group_name"
+        ;;
+    esac
+    echo "Created group: $group_name"
+  else
+    echo "Group '$group_name' already exists."
+  fi
+
+  # --- Sudo privileges ---
+  local grant_sudo
+  echo ""
+  echo "SECURITY WARNING: Granting sudo privileges allows this user to execute" >&2
+  echo "  any command as root. This increases the attack surface if the account" >&2
+  echo "  is compromised." >&2
+  read -r -p "Grant sudo privileges to '$new_username'? [y/N]: " grant_sudo || true
+  grant_sudo="$(echo "${grant_sudo:-}" | tr '[:upper:]' '[:lower:]')"
+
+  # --- Create user ---
+  local user_shell="/bin/bash"
+  if [ "$family" = "alpine" ] && [ ! -x /bin/bash ]; then
+    user_shell="/bin/ash"
+  fi
+
+  case "$family" in
+    alpine)
+      adduser -D -u "$new_uid" -G "$group_name" -s "$user_shell" "$new_username"
+      ;;
+    *)
+      useradd -m -u "$new_uid" -g "$group_name" -s "$user_shell" "$new_username"
+      ;;
+  esac
+  echo ""
+  echo "Created user '$new_username' (UID: $new_uid, Group: $group_name, Shell: $user_shell)"
+
+  # --- Set password ---
+  echo ""
+  echo "Set a password for '$new_username' (used for sudo and local login):"
+  passwd "$new_username" || maybe_warn "Password not set. You can set it later with: passwd $new_username"
+
+  # --- Apply sudo ---
+  if [ "$grant_sudo" = "y" ] || [ "$grant_sudo" = "yes" ]; then
+    local sudo_done=0
+    case "$family" in
+      debian)
+        if getent group sudo >/dev/null 2>&1; then
+          usermod -aG sudo "$new_username"
+          echo "Added '$new_username' to sudo group."
+          sudo_done=1
+        fi
+        ;;
+      alpine)
+        if command -v apk >/dev/null 2>&1; then
+          apk add --no-cache sudo 2>/dev/null || true
+        fi
+        if getent group wheel >/dev/null 2>&1; then
+          adduser "$new_username" wheel 2>/dev/null || usermod -aG wheel "$new_username" 2>/dev/null || true
+          echo "Added '$new_username' to wheel group."
+          sudo_done=1
+        fi
+        ;;
+      rhel)
+        if getent group wheel >/dev/null 2>&1; then
+          usermod -aG wheel "$new_username"
+          echo "Added '$new_username' to wheel group."
+          sudo_done=1
+        fi
+        ;;
+    esac
+    # Fallback: create validated sudoers.d entry if no group method worked
+    if [ "$sudo_done" = "0" ]; then
+      write_sudoers_entry "$new_username"
+    fi
+  fi
+
+  # --- SSH authorized_keys setup ---
+  local new_key_file
+  new_key_file="$(ensure_ssh_paths "$new_username")"
+
+  local has_existing_keys=0
+  if [ -n "$existing_key_file" ] && [ -f "$existing_key_file" ] && has_valid_keys "$existing_key_file"; then
+    has_existing_keys=1
+  fi
+
+  echo ""
+  echo "Set up SSH authorized_keys for '$new_username':" >&2
+  echo "" >&2
+  if [ "$has_existing_keys" = "1" ]; then
+    echo "  1) Use the same SSH key(s) as '$existing_username' (Recommended)" >&2
+    echo "  2) Add new SSH public key(s) manually" >&2
+    echo "  3) Skip (no SSH key setup)" >&2
+    echo "" >&2
+
+    local key_choice
+    while true; do
+      read -r -p "SSH key setup [1-3, default=1]: " key_choice || true
+      key_choice="${key_choice:-1}"
+      case "$key_choice" in
+        1) break ;;
+        2) break ;;
+        3) break ;;
+        *) echo "Invalid choice. Please enter 1, 2, or 3." >&2 ;;
+      esac
+    done
+  else
+    echo "  1) Add new SSH public key(s) manually" >&2
+    echo "  2) Skip (no SSH key setup)" >&2
+    echo "" >&2
+
+    local key_choice
+    while true; do
+      read -r -p "SSH key setup [1-2, default=1]: " key_choice || true
+      key_choice="${key_choice:-1}"
+      case "$key_choice" in
+        1) key_choice="2"; break ;;  # Map to "add new" option
+        2) key_choice="3"; break ;;  # Map to "skip" option
+        *) echo "Invalid choice. Please enter 1 or 2." >&2 ;;
+      esac
+    done
+  fi
+
+  case "$key_choice" in
+    1)
+      # Copy existing keys
+      cp "$existing_key_file" "$new_key_file"
+      chmod 600 "$new_key_file"
+      chown "$new_username":"$group_name" "$new_key_file" 2>/dev/null || true
+      echo "Copied SSH authorized_keys from '$existing_username' to '$new_username'."
+      ;;
+    2)
+      # Add new keys interactively
+      local any_new_key=0
+      while IFS= read -r key; do
+        [ -n "$key" ] || continue
+        any_new_key=1
+        add_key_if_missing "$new_key_file" "$key"
+      done < <(read_keys_interactive)
+      if [ "$any_new_key" = "0" ]; then
+        maybe_warn "No SSH keys added for '$new_username'."
+        echo "  Password auth is disabled. This user cannot SSH in without keys." >&2
+      else
+        chmod 600 "$new_key_file"
+        chown "$new_username":"$group_name" "$new_key_file" 2>/dev/null || true
+      fi
+      ;;
+    3)
+      maybe_warn "Skipped SSH key setup for '$new_username'."
+      echo "  Password auth is disabled. This user cannot SSH in without keys." >&2
+      echo "  Add keys later: ssh-copy-id -p <port> $new_username@<server-ip>" >&2
+      ;;
+  esac
+
+  # --- Warn if AllowUsers/AllowGroups may block SSH access ---
+  if grep -Eq '^[[:space:]]*AllowUsers[[:space:]]' "$SSHD_CONFIG_DEFAULT" 2>/dev/null; then
+    echo ""
+    maybe_warn "sshd_config contains an AllowUsers directive."
+    echo "  You may need to add '$new_username' to AllowUsers for SSH access." >&2
+  fi
+  if grep -Eq '^[[:space:]]*AllowGroups[[:space:]]' "$SSHD_CONFIG_DEFAULT" 2>/dev/null; then
+    maybe_warn "sshd_config contains an AllowGroups directive."
+    echo "  You may need to add '$group_name' to AllowGroups for SSH access." >&2
+  fi
+
+  echo ""
+  echo "User '$new_username' created successfully."
 }
 
 main() {
@@ -790,6 +1033,9 @@ main() {
   _ROLLBACK_BACKUP=""
   _ROLLBACK_CFG=""
   _ROLLBACK_FAMILY=""
+
+  # Offer to create a new system user (after hardening is complete)
+  create_new_user_interactive "$family" "$key_file" "$username"
 
   echo ""
   echo "Done. SSH hardening complete!"
