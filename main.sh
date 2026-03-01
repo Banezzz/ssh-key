@@ -786,21 +786,82 @@ create_new_user_interactive() {
     fi
   fi
 
-  # --- Copy SSH authorized_keys ---
+  # --- SSH authorized_keys setup ---
+  local new_key_file
+  new_key_file="$(ensure_ssh_paths "$new_username")"
+
+  local has_existing_keys=0
   if [ -n "$existing_key_file" ] && [ -f "$existing_key_file" ] && has_valid_keys "$existing_key_file"; then
-    echo ""
-    local copy_keys
-    read -r -p "Copy SSH authorized_keys from '$existing_username' to '$new_username'? [Y/n]: " copy_keys || true
-    copy_keys="$(echo "${copy_keys:-y}" | tr '[:upper:]' '[:lower:]')"
-    if [ "$copy_keys" = "y" ] || [ "$copy_keys" = "yes" ]; then
-      local new_key_file
-      new_key_file="$(ensure_ssh_paths "$new_username")"
+    has_existing_keys=1
+  fi
+
+  echo ""
+  echo "Set up SSH authorized_keys for '$new_username':" >&2
+  echo "" >&2
+  if [ "$has_existing_keys" = "1" ]; then
+    echo "  1) Use the same SSH key(s) as '$existing_username' (Recommended)" >&2
+    echo "  2) Add new SSH public key(s) manually" >&2
+    echo "  3) Skip (no SSH key setup)" >&2
+    echo "" >&2
+
+    local key_choice
+    while true; do
+      read -r -p "SSH key setup [1-3, default=1]: " key_choice || true
+      key_choice="${key_choice:-1}"
+      case "$key_choice" in
+        1) break ;;
+        2) break ;;
+        3) break ;;
+        *) echo "Invalid choice. Please enter 1, 2, or 3." >&2 ;;
+      esac
+    done
+  else
+    echo "  1) Add new SSH public key(s) manually" >&2
+    echo "  2) Skip (no SSH key setup)" >&2
+    echo "" >&2
+
+    local key_choice
+    while true; do
+      read -r -p "SSH key setup [1-2, default=1]: " key_choice || true
+      key_choice="${key_choice:-1}"
+      case "$key_choice" in
+        1) key_choice="2"; break ;;  # Map to "add new" option
+        2) key_choice="3"; break ;;  # Map to "skip" option
+        *) echo "Invalid choice. Please enter 1 or 2." >&2 ;;
+      esac
+    done
+  fi
+
+  case "$key_choice" in
+    1)
+      # Copy existing keys
       cp "$existing_key_file" "$new_key_file"
       chmod 600 "$new_key_file"
       chown "$new_username":"$group_name" "$new_key_file" 2>/dev/null || true
-      echo "Copied authorized_keys to '$new_username'."
-    fi
-  fi
+      echo "Copied SSH authorized_keys from '$existing_username' to '$new_username'."
+      ;;
+    2)
+      # Add new keys interactively
+      local any_new_key=0
+      while IFS= read -r key; do
+        [ -n "$key" ] || continue
+        any_new_key=1
+        add_key_if_missing "$new_key_file" "$key"
+      done < <(read_keys_interactive)
+      if [ "$any_new_key" = "0" ]; then
+        maybe_warn "No SSH keys added for '$new_username'."
+        echo "  Password auth is disabled. This user cannot SSH in without keys." >&2
+      else
+        chmod 600 "$new_key_file"
+        chown "$new_username":"$group_name" "$new_key_file" 2>/dev/null || true
+      fi
+      ;;
+    3)
+      maybe_warn "Skipped SSH key setup for '$new_username'."
+      echo "  Password auth is disabled. This user cannot SSH in without keys." >&2
+      echo "  Add keys later: ssh-copy-id -p <port> $new_username@<server-ip>" >&2
+      ;;
+  esac
 
   # --- Warn if AllowUsers/AllowGroups may block SSH access ---
   if grep -Eq '^[[:space:]]*AllowUsers[[:space:]]' "$SSHD_CONFIG_DEFAULT" 2>/dev/null; then
