@@ -186,7 +186,7 @@ ensure_ssh_paths() {
     if [ "$group_write" -ge 2 ] 2>/dev/null || [ "$other_write" -ge 2 ] 2>/dev/null; then
       maybe_warn "Home directory $home has permissive permissions ($home_perms). StrictModes may reject key auth."
       chmod go-w "$home"
-      echo "Fixed: removed group/other write from $home"
+      echo "Fixed: removed group/other write from $home" >&2
     fi
   fi
 
