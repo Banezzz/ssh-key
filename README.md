@@ -1,6 +1,24 @@
 # ssh-key — VPS / 独立服务器 SSH 与基础安全加固
 
-单文件 Bash 脚本：把 SSH 改为**仅公钥登录**、迁移到自定义端口（默认 **54271**），并可选地完成 fail2ban、自动安全更新、内核/网络 sysctl 加固和重启检查。全程有防锁死保护：分阶段应用、`sshd -T` 生效校验、端口监听校验，以及**未确认新登录则自动回滚**的倒计时。
+单文件 Bash 脚本，带中文交互菜单：把 SSH 改为**仅公钥登录**、迁移到自定义端口（默认 **54271**），并提供安全评分体检、公钥 / 用户 / fail2ban 管理、登录记录、登录提醒推送（Telegram / 企业微信 / 钉钉 / 飞书）、备份恢复，以及可选的自动安全更新、内核/网络 sysctl 加固和重启检查。全程有防锁死保护：分阶段应用、`sshd -T` 生效校验、端口监听校验，以及**未确认新登录则自动回滚**的倒计时。
+
+![主菜单](docs/menu.png)
+
+## 主菜单
+
+不带参数运行 `sudo bash main.sh` 即进入主菜单，顶部实时显示系统、SSH、防护状态和安全评分：
+
+| 菜单 | 功能 | 命令行直达 |
+| --- | --- | --- |
+| 1 一键加固向导 | 6 步向导：端口 → 用户与公钥 → 等级 → 账户与 root 登录 → 附加防护 → 确认计划，然后两阶段应用 + 倒计时确认 | `--wizard` |
+| 2 安全体检与评分 | 约 20 项检查（SSH 实际生效配置、弱公钥、空密码、UID 0、防火墙、fail2ban、自动更新、内核参数、待重启），给出 0–100 分、A–D 等级和改进建议；只读 | `--audit` |
+| 3 SSH 公钥管理 | 按用户列出公钥（类型 / 位数 / 指纹 / 备注），标出**当前会话正在使用的公钥**和弱公钥；添加（粘贴或 `gh:用户名`）、删除（删除前自动备份，删光最后一把会强烈警告） | `--keys` |
+| 4 用户管理 | 用户列表（sudo / 公钥数 / 密码状态）；新建 sudo 用户、授予/撤销 sudo、禁用/启用账户（账户过期，连公钥也无法登录）、设置密码；拒绝修改 root 和你自己 | `--users` |
+| 5 fail2ban 管理 | 未安装时一键安装；查看失败次数与封禁列表，解封 / 封禁 IP（拒绝封禁你自己的 IP） | `--fail2ban-status` |
+| 6 登录记录 | 最近 7 天成功登录：时间、用户、来源、方式、**使用的是哪把公钥**（按指纹对应到公钥备注）；失败尝试总数与来源 IP 排行；当前在线 | `--logins` |
+| 7 登录提醒 | 每次 SSH 登录推送到 Telegram / 企业微信 / 钉钉 / 飞书 / 自定义 Webhook；先发测试消息，成功才启用 | `--notify` |
+| 8 备份与恢复 | 列出每次运行的备份并可任选恢复；清理旧备份时**始终保留最初的原始备份** | `--backups` / `--restore` |
+| 9 切换语言 | 中文 / English，选择会被记住 | `--lang zh\|en` |
 
 ## 支持的系统
 
@@ -27,9 +45,19 @@ sudo bash main.sh              # 交互式加固
 curl -fsSL https://raw.githubusercontent.com/Banezzz/ssh-key/main/main.sh | sudo bash
 ```
 
-交互流程：端口 → 登录用户 → 公钥（可粘贴，或输入 `gh:<GitHub用户名>` 导入）→ 加固等级 →（可选）创建 sudo 用户 → root 登录策略 / AllowUsers → 附加模块 → **显示完整计划后确认** → 执行 → 在新终端验证登录并输入 `yes` →（standard/strict）重启提示。
+向导流程：端口（回车用 54271，输入 `r` 随机选一个空闲端口）→ 登录用户 → 公钥（可粘贴，或输入 `gh:<GitHub用户名>` 导入）→ 加固等级 →（可选）创建 sudo 用户 → root 登录策略 / AllowUsers → 附加模块（含登录提醒）→ **显示完整计划后确认** → 执行 → 在新终端验证登录并输入 `yes` →（standard/strict）重启提示。
 
 确认计划之前**不会修改任何文件**；`--dry-run` 会走完全部问题并打印将写入的配置后退出。
+
+| 执行计划 | 验证新登录与完成 |
+| --- | --- |
+| ![执行计划](docs/plan.png) | ![完成](docs/finish.png) |
+
+### 界面语言与终端兼容
+
+- 默认中文；`--lang en` 或环境变量 `SSH_HARDEN_LANG=en` 切换英文，菜单 9 的选择会保存。
+- 在无法显示中文的 Linux 本地控制台（`TERM=linux`，如部分 VNC 控制台）自动使用英文和 ASCII 符号；也可设置 `SSH_HARDEN_ASCII=1` 强制 ASCII，`NO_COLOR=1` 关闭颜色。
+- 界面不依赖右侧边框对齐，在把制表符/方块字符按双宽显示的终端（Xshell、FinalShell、iTerm2 的“歧义宽度按双宽”选项）中也不会错位。
 
 ## 加固等级
 
@@ -64,6 +92,20 @@ curl -fsSL https://raw.githubusercontent.com/Banezzz/ssh-key/main/main.sh | sudo
 | sysctl | SYN cookies、禁止 ICMP 重定向/源路由、`kptr_restrict`、`dmesg_restrict`、`ptrace_scope`、受保护硬/软链接等；strict 另加 `log_martians`、禁止非特权 BPF、`bpf_jit_harden` 等。只写入内核支持的键。**不改动** `ip_forward` 与 `rp_filter`（Docker/VPN/路由主机依赖它们） |
 | 端口保留 | 若 SSH 端口位于临时端口范围（默认 54271 就在 32768–60999 内），自动加入 `net.ipv4.ip_local_reserved_ports`，避免出站连接占用该端口导致 sshd 重启后无法绑定 |
 
+## 登录提醒
+
+菜单 7（或 `--notify`）配置，每次 SSH 登录推送一条消息，例如：`[SSH 登录提醒] 用户 deploy 登录了 web-01，来源 203.0.113.7，时间 2026-10-28 11:16:25 CST`。
+
+| 渠道 | 需要填写 | 说明 |
+| --- | --- | --- |
+| Telegram | Bot Token（@BotFather）+ Chat ID | 中国大陆服务器通常无法访问 `api.telegram.org` |
+| 企业微信机器人 | Webhook 地址 | 群机器人 |
+| 钉钉机器人 | Webhook 地址 | 安全设置里添加关键词 `SSH` |
+| 飞书 / Lark 机器人 | Webhook 地址 | |
+| 自定义 Webhook | URL | POST JSON：`{"text","user","host","from"}` |
+
+实现方式：在 `/etc/pam.d/sshd` 追加一行 `session optional pam_exec.so quiet /usr/local/sbin/ssh-hardening-notify`。`optional` 保证提醒脚本出错**永远不会阻止登录**，消息在后台发送，不会拖慢登录。配置保存在 `/etc/ssh-hardening/notify.conf`（权限 600）。需要 sshd 启用 PAM（`UsePAM yes`，主流发行版默认开启；Alpine 需安装 `openssh-server-pam`）。配置时会先发送测试消息，发送成功才会启用。
+
 ## 关于重启
 
 修改 SSH、防火墙、sysctl **都是即时生效的，本身不需要重启**。脚本在结束时：
@@ -75,10 +117,18 @@ curl -fsSL https://raw.githubusercontent.com/Banezzz/ssh-key/main/main.sh | sudo
 ## 命令行参数
 
 ```text
-模式
-      --audit              只读安全体检（不修改任何内容）
-      --dry-run            回答所有问题并显示计划与生成的配置，不修改任何内容
+功能模式（不带参数时进入主菜单）
+      --wizard             直接进入一键加固向导
+      --audit              安全体检与评分（只读）
+      --keys               SSH 公钥管理
+      --users              用户管理
+      --logins             登录记录与失败来源统计
+      --fail2ban-status    fail2ban 管理
+      --notify             登录提醒
+      --backups            备份管理
       --restore [DIR]      从最近一次（或指定）备份恢复 SSH 配置
+      --dry-run            走完向导并显示计划，不做任何修改
+      --lang zh|en         界面语言
 
 SSH
   -p, --port N             SSH 端口（默认 54271；22 或 1024–65535）
@@ -123,4 +173,4 @@ sudo bash main.sh --yes -p 2222 -l standard -u deploy -k gh:your-github-name \
 - 客户端 ssh-agent 中密钥较多时，请在 `~/.ssh/config` 中使用 `IdentitiesOnly yes` + `IdentityFile`，否则可能在尝试到正确密钥前就耗尽 `MaxAuthTries`。
 - RHEL 8 的 crypto-policies 通过命令行参数传给 sshd，会覆盖 strict 设置的算法列表；如需更严格，可执行 `update-crypto-policies --set FUTURE`。
 - 恢复只回滚 SSH 配置；已放行的防火墙规则、SELinux 端口标签、已创建的用户与已安装的软件包会保留。
-- 脚本输出为英文，便于在不支持中文的 VNC/串口控制台中阅读。
+- 公钥管理删除公钥前会备份到 `/var/lib/ssh-hardening/keys-backup/`；“当前会话”标记依赖 `LogLevel VERBOSE`（standard / strict 等级会开启）。
